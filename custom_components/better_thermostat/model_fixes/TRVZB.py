@@ -616,6 +616,22 @@ async def maybe_set_external_temperature(self, entity_id, temperature: float) ->
                 entity_id,
             )
             return False
+        # A device on the remote option reports the written value as its own
+        # reading, so mirroring that reading back into it, and switching it
+        # over to it, freezes the room temperature at the first value written.
+        room_sensor = entity_registry.async_get(self.sensor_entity_id or "")
+        if (
+            room_sensor is not None
+            and room_sensor.device_id is not None
+            and room_sensor.device_id == reg_entity.device_id
+        ):
+            _LOGGER.debug(
+                "better_thermostat %s: TRVZB external temperature not mirrored: room sensor %s belongs to %s",
+                self.device_name,
+                self.sensor_entity_id,
+                entity_id,
+            )
+            return False
         target = _find_device_entity(
             entity_registry,
             reg_entity.device_id,

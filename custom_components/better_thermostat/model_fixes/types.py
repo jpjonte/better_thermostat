@@ -103,6 +103,8 @@ class ModelFixHost(Protocol):
     # is attributed to the same origin as the rest of the cycle.
     context: Any
     real_trvs: Mapping[str, _TrvLike]
+    # Entity id of the room temperature sensor, None when none is set.
+    sensor_entity_id: str | None
 
     @property
     def hass(self) -> _HassLike:
