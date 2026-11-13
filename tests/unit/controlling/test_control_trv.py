@@ -33,6 +33,7 @@ from custom_components.better_thermostat.utils.const import (
     CalibrationType,
 )
 from custom_components.better_thermostat.utils.controlling import (
+    MIN_VALVE_WRITE_INTERVAL_S,
     WRITE_CONFIRM_TIMEOUT_S,
     check_calibration,
     check_system_mode,
@@ -3544,3 +3545,154 @@ class TestSnappingSelectOffsetConverges:
                 await control_trv(mock_self, "climate.trv1")
 
         assert device.written == ["-3.0k", "3.0k"]
+
+
+class TestValveWriteBudget:
+    """Valve writes to one TRV are spaced, so its own reports cannot burst them.
+
+    A TRV answers every valve write with a report of its internal
+    temperature. When that reading drives the room, each report starts a
+    control cycle that computes another opening, and the TRV receives
+    several writes within seconds. Closing for OFF is exempt: it is the
+    safe direction and follows a mode the user or a contact set.
+    """
+
+    @staticmethod
+    def _self_with_balance(valve_percent, *, scheduled=None, **kwargs):
+        trv = _default_trv_config(
+            advanced={
+                "calibration_mode": CalibrationMode.HEATING_POWER_CALIBRATION,
+                "calibration": CalibrationType.DIRECT_VALVE_BASED,
+                "no_off_system_mode": False,
+            }
+        )
+        trv.calibration_balance = {"valve_percent": valve_percent, "apply_valve": True}
+        mock_self = _make_mock_self(
+            trv_state=HVACMode.HEAT,
+            trv_attrs={"temperature": 20.0},
+            real_trvs={"climate.trv1": trv},
+            **kwargs,
+        )
+        if scheduled is not None:
+
+            def _capture(coro, **_kwargs):
+                scheduled.append(coro)
+                return Mock()
+
+            mock_self.task_manager = Mock(create_task=Mock(side_effect=_capture))
+        return mock_self
+
+    @staticmethod
+    async def _cycle(mock_self, now, system_mode=HVACMode.HEAT):
+        with (
+            patch(_PATCHES["convert_outbound_states"]) as mock_convert,
+            patch(_PATCHES["set_valve"], new=AsyncMock(return_value=True)) as valve,
+            patch(_PATCHES["set_temperature"], new=AsyncMock()),
+            patch(
+                _PATCHES["override_set_hvac_mode"], new=AsyncMock(return_value=False)
+            ),
+            patch(
+                _PATCHES["override_set_temperature"], new=AsyncMock(return_value=False)
+            ),
+            patch(_PATCHES["set_hvac_mode"], new=AsyncMock()),
+            patch("asyncio.sleep", new=AsyncMock()),
+            patch(f"{_CTRL}.monotonic", return_value=now),
+        ):
+            mock_convert.return_value = {
+                "temperature": 20.0,
+                "system_mode": system_mode,
+            }
+            assert await control_trv(mock_self, "climate.trv1") is True
+        return [call.args[2] for call in valve.await_args_list]
+
+    @pytest.mark.asyncio
+    async def test_a_second_opening_within_the_interval_is_held_back(self):
+        """A new opening seconds after the last valve write is not written yet."""
+        mock_self = self._self_with_balance(41)
+        trv = mock_self.real_trvs["climate.trv1"]
+        assert await self._cycle(mock_self, 1000.0) == [41]
+
+        trv.calibration_balance = {"valve_percent": 6, "apply_valve": True}
+        assert await self._cycle(mock_self, 1003.0) == []
+
+    @pytest.mark.asyncio
+    async def test_the_held_back_opening_is_written_once_the_interval_is_over(self):
+        """The cycle after the interval writes the opening computed then."""
+        mock_self = self._self_with_balance(41)
+        trv = mock_self.real_trvs["climate.trv1"]
+        await self._cycle(mock_self, 1000.0)
+
+        trv.calibration_balance = {"valve_percent": 16, "apply_valve": True}
+        assert await self._cycle(mock_self, 1000.0 + MIN_VALVE_WRITE_INTERVAL_S) == [16]
+
+    @pytest.mark.asyncio
+    async def test_closing_for_off_is_written_at_once(self):
+        """OFF closes the valve even right after a valve write."""
+        mock_self = self._self_with_balance(41)
+        await self._cycle(mock_self, 1000.0)
+
+        mock_self.bt_hvac_mode = HVACMode.OFF
+        assert await self._cycle(mock_self, 1001.0, system_mode=HVACMode.OFF) == [0]
+
+    @pytest.mark.asyncio
+    async def test_an_opening_right_after_closing_for_off_is_written_at_once(self):
+        """Closing for OFF does not start the interval: switched on, the valve opens."""
+        mock_self = self._self_with_balance(41, bt_hvac_mode=HVACMode.OFF)
+        assert await self._cycle(mock_self, 1000.0, system_mode=HVACMode.OFF) == [0]
+
+        mock_self.bt_hvac_mode = HVACMode.HEAT
+        assert await self._cycle(mock_self, 1001.0) == [41]
+
+    @pytest.mark.asyncio
+    async def test_a_held_back_write_queues_one_cycle_for_when_it_is_due(self):
+        """One catch-up cycle is queued however many writes are held back."""
+        scheduled = []
+        mock_self = self._self_with_balance(41, scheduled=scheduled)
+        mock_self.control_queue_task = asyncio.Queue(maxsize=1)
+        trv = mock_self.real_trvs["climate.trv1"]
+        await self._cycle(mock_self, 1000.0)
+        assert scheduled == []
+
+        for now, percent in ((1003.0, 6), (1011.0, 16)):
+            trv.calibration_balance = {"valve_percent": percent, "apply_valve": True}
+            await self._cycle(mock_self, now)
+        assert len(scheduled) == 1
+
+        with patch("asyncio.sleep", new=AsyncMock()) as sleep:
+            await scheduled[0]
+        sleep.assert_awaited_once_with(MIN_VALVE_WRITE_INTERVAL_S - 3.0)
+        assert mock_self.control_queue_task.qsize() == 1
+
+        # Once the catch-up has run, the next held-back write queues another.
+        trv.calibration_balance = {"valve_percent": 30, "apply_valve": True}
+        await self._cycle(mock_self, 1020.0)
+        assert len(scheduled) == 2
+        scheduled[1].close()
+
+    @pytest.mark.asyncio
+    async def test_a_write_no_channel_took_does_not_start_the_interval(self):
+        """Only a write a channel accepted holds back the next one."""
+        mock_self = self._self_with_balance(41)
+        trv = mock_self.real_trvs["climate.trv1"]
+        with (
+            patch(_PATCHES["convert_outbound_states"]) as mock_convert,
+            patch(_PATCHES["set_valve"], new=AsyncMock(return_value=None)),
+            patch(_PATCHES["set_temperature"], new=AsyncMock()),
+            patch(
+                _PATCHES["override_set_hvac_mode"], new=AsyncMock(return_value=False)
+            ),
+            patch(
+                _PATCHES["override_set_temperature"], new=AsyncMock(return_value=False)
+            ),
+            patch(_PATCHES["set_hvac_mode"], new=AsyncMock()),
+            patch("asyncio.sleep", new=AsyncMock()),
+            patch(f"{_CTRL}.monotonic", return_value=1000.0),
+        ):
+            mock_convert.return_value = {
+                "temperature": 20.0,
+                "system_mode": HVACMode.HEAT,
+            }
+            await control_trv(mock_self, "climate.trv1")
+
+        trv.calibration_balance = {"valve_percent": 6, "apply_valve": True}
+        assert await self._cycle(mock_self, 1003.0) == [6]

@@ -6,7 +6,7 @@ import asyncio
 from dataclasses import dataclass
 import logging
 from time import monotonic
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.climate.const import PRESET_BOOST, HVACMode
 from homeassistant.const import (
@@ -73,6 +73,9 @@ from custom_components.better_thermostat.utils.watcher import (
     UNKNOWN_STATES,
 )
 
+if TYPE_CHECKING:
+    from custom_components.better_thermostat.trv import Trv
+
 _LOGGER = logging.getLogger(__name__)
 
 # How long a write channel waits for the device to confirm a command before it
@@ -131,6 +134,14 @@ _VALVE_BALANCE_MODES = frozenset(
         CalibrationMode.HEATING_POWER_CALIBRATION,
     }
 )
+
+# Minimum spacing between two valve writes to one TRV. A TRV answers each
+# valve write with a report of its internal temperature; where that reading is
+# the room temperature, the cycle the report starts computes a new opening, and
+# without a spacing the TRV receives several writes within seconds. 2.0 spaces
+# every non-safety write by the same interval. Closing for OFF is exempt and
+# does not start the interval.
+MIN_VALVE_WRITE_INTERVAL_S = 30.0
 
 
 def _get_valve_control(
@@ -287,6 +298,61 @@ class _FailedCycleRun:
 def _user_intent(self) -> tuple[Any, ...]:
     """Return the room targets a user sets, as the failure pacing compares them."""
     return (self.bt_target_temp, self.bt_target_cooltemp, self.bt_hvac_mode)
+
+
+async def _catch_up_valve_write(self, trv: Trv, delay_s: float) -> None:
+    """Queue a control cycle once a held-back valve write may go out.
+
+    The cycle computes the opening afresh, so the TRV gets the value that is
+    current then rather than the one held back.
+    """
+    try:
+        await asyncio.sleep(delay_s)
+    finally:
+        trv.valve_write_catch_up_pending = False
+    try:
+        self.control_queue_task.put_nowait(self)
+    except asyncio.QueueFull:
+        # A cycle is already queued, and it computes the same opening.
+        pass
+
+
+def _valve_write_held_back(self, heater_entity_id: str, source: str | None) -> bool:
+    """Whether a valve write comes too soon after the last one to go out.
+
+    A held-back write queues one control cycle for when the spacing is over.
+    Closing for OFF is never held back and does not start a spacing.
+    """
+    trv = self.real_trvs[heater_entity_id]
+    last = trv.last_valve_write_monotonic
+    if source == "hvac_off" or last is None:
+        return False
+    remaining = MIN_VALVE_WRITE_INTERVAL_S - (monotonic() - last)
+    if remaining <= 0:
+        return False
+    _LOGGER.debug(
+        "better_thermostat %s: valve write to %s held back for %.0f s, the last "
+        "one went out %.0f s ago",
+        self.device_name,
+        heater_entity_id,
+        remaining,
+        MIN_VALVE_WRITE_INTERVAL_S - remaining,
+    )
+    if not trv.valve_write_catch_up_pending:
+        trv.valve_write_catch_up_pending = True
+        task = self.task_manager.create_task(
+            _catch_up_valve_write(self, trv, remaining),
+            name=f"bt_valve_catch_up_{heater_entity_id}",
+        )
+        if task is None:
+            trv.valve_write_catch_up_pending = False
+        else:
+            # A task cancelled before its coroutine starts never reaches the
+            # coroutine's own reset.
+            task.add_done_callback(
+                lambda _task: setattr(trv, "valve_write_catch_up_pending", False)
+            )
+    return True
 
 
 async def _requeue_failed_cycle(self, delay_s: float) -> None:
@@ -1423,6 +1489,10 @@ async def control_trv(self, heater_entity_id=None):
                     )
                 ):
                     valve_settings = None
+                if valve_settings is not None and _valve_write_held_back(
+                    self, heater_entity_id, _source
+                ):
+                    valve_settings = None
                 if valve_settings is not None:
                     target_pct = int(round(valve_settings.get("valve_percent", 0)))
                     _LOGGER.debug(
@@ -1433,6 +1503,12 @@ async def control_trv(self, heater_entity_id=None):
                         _source,
                     )
                     ok = await set_valve(self, heater_entity_id, target_pct)
+                    # Closing for OFF leaves the spacing alone, so the valve
+                    # opens at once when heating resumes.
+                    if ok and _source != "hvac_off":
+                        self.real_trvs[
+                            heater_entity_id
+                        ].last_valve_write_monotonic = monotonic()
                     if ok is False:
                         _valve_write_failed = True
                     elif not ok:
