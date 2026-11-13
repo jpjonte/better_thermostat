@@ -30,13 +30,16 @@ VALVE_MAINTENANCE_INTERVAL_HOURS = 84
 # Some users report that the TRVZB motor can occasionally lose its calibration and
 # fail to fully close the valve when commanded to very small openings.
 #
-# Workaround: when requesting a further close (target_pct < last_pct), briefly
-# command the valve to open a bit more and then to the requested target. A
-# close that arrives while that delayed write is still due is written straight
-# away instead of bumping again, so the requested position always reaches the
-# device.
+# Workaround: when requesting a further close (target_pct < last_pct) to a
+# small opening, briefly command the valve to open a bit more and then to the
+# requested target. A close to a wider opening is written directly: the motor
+# problem only shows near the closed end, and bumping every close turns each
+# closing step into two writes 5 s apart. A close that arrives while the
+# delayed write is still due is written straight away instead of bumping
+# again, so the requested position always reaches the device.
 _TRVZB_CLOSE_BUMP_OPEN_DELTA_PCT = 10
 _TRVZB_CLOSE_BUMP_DELAY_S = 5.0
+_TRVZB_CLOSE_BUMP_MAX_TARGET_PCT = 10
 
 
 def _cancel_pending_valve_bump(trv_state) -> bool:
@@ -364,9 +367,14 @@ async def override_set_valve(self, entity_id, percent: int):
             ok = await maybe_set_sonoff_valve_percent(self, entity_id, target_pct)
             return bool(ok)
 
-        # Only apply workaround when closing further, and only when the motor
-        # was not already driven open by a bump whose write is still due.
-        if target_pct < last_pct and not bump_pending:
+        # Only apply workaround when closing further to a small opening, and
+        # only when the motor was not already driven open by a bump whose
+        # write is still due.
+        if (
+            target_pct < last_pct
+            and target_pct <= _TRVZB_CLOSE_BUMP_MAX_TARGET_PCT
+            and not bump_pending
+        ):
             bump_pct = min(100, int(last_pct) + _TRVZB_CLOSE_BUMP_OPEN_DELTA_PCT)
 
             # If we can't "bump open", fall back to direct set.
@@ -403,8 +411,8 @@ async def override_set_valve(self, entity_id, percent: int):
             )
             return True
 
-        # Opening, unchanged, or a close following a bump that has not run yet:
-        # write the requested position. Bumping again would drive the valve
+        # Opening, unchanged, a close to a wider opening, or a close following
+        # a bump that has not run yet: write the requested position. Bumping again would drive the valve
         # further open on every closing step while the target the cancelled
         # write was carrying never reaches the device.
         ok = await maybe_set_sonoff_valve_percent(self, entity_id, target_pct)
